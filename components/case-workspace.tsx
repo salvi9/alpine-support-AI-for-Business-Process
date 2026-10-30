@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { POLICY_CLAUSES } from "@/lib/policy";
+import { evaluateImported, extractionPrompt, parseExtraction, replyPrompt } from "@/lib/manual-ai";
 import type { RulesResult } from "@/lib/rules";
 import type { Decision, Extraction, Order, TestCase } from "@/lib/types";
 
@@ -67,12 +68,17 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
-export function CaseWorkspace({ cases }: { cases: CaseView[] }) {
+export function CaseWorkspace({ cases, orders, policy }: { cases: CaseView[]; orders: Order[]; policy: string }) {
   const [selectedId, setSelectedId] = useState(cases[0]?.testCase.case_id);
   const [statuses, setStatuses] = useState<Record<string, ReviewStatus>>({});
   const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [imports, setImports] = useState<Record<string, Extraction>>({});
 
-  const current = cases.find((c) => c.testCase.case_id === selectedId) ?? cases[0];
+  const views = cases.map((c) => {
+    const extraction = imports[c.testCase.case_id];
+    return extraction ? { ...c, extraction, ...evaluateImported(c.testCase, extraction, orders) } : c;
+  });
+  const current = views.find((c) => c.testCase.case_id === selectedId) ?? views[0];
   if (!current) return null;
 
   const id = current.testCase.case_id;
@@ -91,7 +97,7 @@ export function CaseWorkspace({ cases }: { cases: CaseView[] }) {
           </span>
         </div>
         <ul className="max-h-72 overflow-y-auto lg:max-h-[calc(100%-2.75rem)]">
-          {cases.map((c) => {
+          {views.map((c) => {
             const cid = c.testCase.case_id;
             const s = statuses[cid] ?? "pending";
             const active = cid === id;
@@ -141,9 +147,31 @@ export function CaseWorkspace({ cases }: { cases: CaseView[] }) {
           <p className="text-sm leading-relaxed whitespace-pre-wrap text-slate-800">{current.testCase.message}</p>
         </Card>
 
+        <ManualAI
+          key={id}
+          view={current}
+          orders={orders}
+          policy={policy}
+          imported={Boolean(imports[id])}
+          onImport={(extraction) => {
+            setImports((prev) => ({ ...prev, [id]: extraction }));
+            setDrafts((prev) => ({ ...prev, [id]: "" }));
+            setStatus("pending");
+          }}
+          onRestore={() => {
+            setImports((prev) => {
+              const next = { ...prev };
+              delete next[id];
+              return next;
+            });
+            setDrafts((prev) => ({ ...prev, [id]: "" }));
+            setStatus("pending");
+          }}
+        />
+
         <div className="grid gap-4 xl:grid-cols-2">
           <OrderCard view={current} />
-          <ExtractionCard extraction={current.extraction} />
+          <ExtractionCard extraction={current.extraction} imported={Boolean(imports[id])} />
         </div>
 
         <div className="grid gap-4 xl:grid-cols-2">
@@ -153,13 +181,17 @@ export function CaseWorkspace({ cases }: { cases: CaseView[] }) {
 
         <Card
           title="Draft reply"
-          aside={<Badge className="bg-violet-100 text-violet-800">AI draft – coming next</Badge>}
+          aside={<Badge className="bg-violet-100 text-violet-800">Paste from ChatGPT</Badge>}
         >
           <textarea
             value={drafts[id] ?? ""}
-            onChange={(e) => setDrafts((prev) => ({ ...prev, [id]: e.target.value }))}
-            readOnly={status !== "editing"}
-            placeholder="AI draft – coming next"
+            onChange={(e) => {
+              setDrafts((prev) => ({ ...prev, [id]: e.target.value }));
+              setStatus("editing");
+            }}
+            aria-label="Customer reply draft"
+            readOnly={status === "approved" || status === "escalated"}
+            placeholder="After importing the extraction, copy the reply prompt above into ChatGPT. Paste its reply here and review it."
             rows={6}
             className={`w-full rounded-md border px-3 py-2 text-sm outline-none ${
               status === "editing"
@@ -170,7 +202,8 @@ export function CaseWorkspace({ cases }: { cases: CaseView[] }) {
           <div className="mt-3 flex flex-wrap items-center gap-2">
             <button
               onClick={() => setStatus("approved")}
-              className="rounded-md bg-emerald-700 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-800"
+              disabled={!drafts[id]?.trim() || !imports[id] || current.rules.escalate || current.rules.decision === "needs_info"}
+              className="rounded-md bg-emerald-700 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-800 disabled:cursor-not-allowed disabled:opacity-40"
             >
               Approve
             </button>
@@ -196,12 +229,102 @@ export function CaseWorkspace({ cases }: { cases: CaseView[] }) {
             )}
           </div>
           <p className="mt-3 text-xs text-slate-500">
-            Prototype: these buttons only change the status on this screen. Nothing is sent to the customer and no
-            refund is issued.
+            Approval requires imported facts, a draft, a complete decision, and no required supervisor review.
+            You can edit a request for missing information or escalate it. Review actions are a simulation;
+            nothing is sent and no refund is issued. All work on this screen is lost on refresh.
           </p>
         </Card>
       </main>
     </div>
+  );
+}
+
+function ManualAI({ view, orders, policy, imported, onImport, onRestore }: {
+  view: CaseView;
+  orders: Order[];
+  policy: string;
+  imported: boolean;
+  onImport: (extraction: Extraction) => void;
+  onRestore: () => void;
+}) {
+  const [input, setInput] = useState("");
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [promptKind, setPromptKind] = useState<"extraction" | "reply">("extraction");
+  const [showPrompt, setShowPrompt] = useState(false);
+  const prompt = promptKind === "extraction"
+    ? extractionPrompt(view.testCase, orders)
+    : replyPrompt(view.testCase, view.extraction, view.order, view.rules, policy);
+
+  async function copyPrompt(kind: "extraction" | "reply") {
+    setPromptKind(kind);
+    const text = kind === "extraction" ? extractionPrompt(view.testCase, orders)
+      : replyPrompt(view.testCase, view.extraction, view.order, view.rules, policy);
+    try {
+      await navigator.clipboard.writeText(text);
+      setNotice(`${kind === "extraction" ? "Extraction" : "Reply"} prompt copied. Paste it into ChatGPT.`);
+    } catch {
+      setShowPrompt(true);
+      setNotice("Clipboard unavailable. Select and copy the prompt below manually.");
+    }
+  }
+
+  return (
+    <Card title="Use ChatGPT with this case" aside={<Badge className="bg-sky-100 text-sky-800">Manual workflow</Badge>}>
+      <p className="text-sm text-slate-600">
+        1. Copy the extraction prompt into a fresh ChatGPT conversation. 2. Paste its JSON here and import.
+        3. Copy the reply prompt into ChatGPT, then paste the draft below for review.
+        Prompts include this case and mock order data; the extraction prompt excludes the answer key.
+      </p>
+      <div className="mt-3 flex flex-wrap gap-2">
+        <button onClick={() => void copyPrompt("extraction")} className="rounded-md bg-sky-700 px-3 py-2 text-sm font-medium text-white hover:bg-sky-800">
+          1. Copy extraction prompt
+        </button>
+        <button disabled={!imported} onClick={() => void copyPrompt("reply")} className="rounded-md border border-slate-300 px-3 py-2 text-sm font-medium hover:bg-slate-50 disabled:opacity-40">
+          3. Copy reply prompt
+        </button>
+        <button onClick={() => setShowPrompt(!showPrompt)} className="px-2 text-sm text-sky-800 underline">
+          {showPrompt ? "Hide prompt" : "View prompt"}
+        </button>
+      </div>
+      {showPrompt && (
+        <label className="mt-3 block text-sm font-medium">
+          {promptKind === "extraction" ? "Extraction prompt" : "Reply prompt"}
+          <textarea aria-label="Prompt to copy into ChatGPT" readOnly value={prompt} rows={10} onFocus={(event) => event.target.select()} className="mt-1 w-full rounded-md border border-slate-300 bg-slate-50 p-3 font-mono text-xs" />
+        </label>
+      )}
+      <label className="mt-4 block text-sm font-medium" htmlFor="extraction-json">ChatGPT extraction JSON</label>
+      <textarea
+        id="extraction-json" value={input} rows={5} spellCheck={false}
+        onChange={(event) => { setInput(event.target.value); setError(""); setNotice(""); }}
+        placeholder="Paste the JSON object returned by ChatGPT"
+        aria-invalid={Boolean(error)} aria-describedby={error ? "extraction-error" : undefined}
+        className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 font-mono text-xs"
+      />
+      <div className="mt-2 flex flex-wrap gap-3">
+        <button disabled={!input.trim()} onClick={() => {
+          try {
+            const ex = parseExtraction(input, orders);
+            onImport(ex);
+            setError("");
+            setPromptKind("extraction");
+            setNotice("Extraction imported and rules recalculated. Previous draft and approval cleared. Verify the facts, then copy the reply prompt.");
+          } catch (cause) {
+            setError(cause instanceof Error ? cause.message : "Cannot import this extraction.");
+            setNotice("");
+          }
+        }} className="rounded-md bg-emerald-700 px-3 py-2 text-sm font-medium text-white disabled:opacity-40">
+          2. Import extraction and run rules
+        </button>
+        {imported && <button onClick={() => {
+          onRestore(); setInput(""); setError(""); setPromptKind("extraction");
+          setNotice("Reference demo restored. Previous draft and approval cleared.");
+        }} className="text-sm text-slate-600 underline">Restore answer-key demo</button>}
+      </div>
+      {error && <p id="extraction-error" role="alert" className="mt-2 text-sm text-rose-700">{error}</p>}
+      <p role="status" className="mt-2 text-sm text-sky-800">{notice}</p>
+      <p className="mt-2 text-xs text-slate-500">No API key needed. This app does not call ChatGPT automatically. Imports, drafts, and reviews last only until refresh.</p>
+    </Card>
   );
 }
 
@@ -263,7 +386,7 @@ function OrderCard({ view }: { view: CaseView }) {
   );
 }
 
-function ExtractionCard({ extraction: ex }: { extraction: Extraction }) {
+function ExtractionCard({ extraction: ex, imported }: { extraction: Extraction; imported: boolean }) {
   const flags = [
     ex.requests_exception && "requests exception",
     ex.legal_or_chargeback_threat && "legal / chargeback threat",
@@ -272,9 +395,11 @@ function ExtractionCard({ extraction: ex }: { extraction: Extraction }) {
   return (
     <Card
       title="Extraction"
-      aside={<Badge className="bg-violet-100 text-violet-800">AI extraction – coming next</Badge>}
+      aside={<Badge className="bg-violet-100 text-violet-800">{imported ? "Imported AI extraction" : "Answer-key demo"}</Badge>}
     >
-      <p className="mb-2 text-xs text-slate-500">Showing the answer-key values until the LLM step is connected.</p>
+      <p className="mb-2 text-xs text-slate-500">
+        {imported ? "Check these AI-suggested facts against the original message. Confidence is self-reported." : "Showing prepared reference facts. Import ChatGPT JSON above to use AI output."}
+      </p>
       <dl>
         <Field label="Order ID">
           <span className="font-mono">{ex.order_id ?? "—"}</span>

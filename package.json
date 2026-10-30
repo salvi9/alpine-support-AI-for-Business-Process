@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test:rules": "tsx scripts/test-rules.ts"
+    "test:rules": "tsx scripts/test-rules.ts",
+    "test:manual-ai": "tsx scripts/test-manual-ai.ts"
   },
   "dependencies": {
     "next": "16.4.3",
